@@ -8,7 +8,7 @@ In Gutter: **Write script** (with "Claude app via MCP" as the provider) or **Set
 
 ## Manual setup
 
-1. Download [`releases/v1.0.0/ScriptGeneratorMcp.exe`](releases/v1.0.0/ScriptGeneratorMcp.exe) (Windows x64, nothing else to install).
+1. Download [`releases/v1.1.0/ScriptGeneratorMcp.exe`](releases/v1.1.0/ScriptGeneratorMcp.exe) (Windows x64, nothing else to install).
 2. Add it to your AI app:
 
 **Claude Desktop**: Settings → Developer → Edit config, then add:
@@ -65,3 +65,21 @@ dotnet publish -c Release -r win-x64 --self-contained true -p:PublishSingleFile=
 ```
 
 Requires the .NET 10 SDK. No NuGet packages.
+
+## Check and fix panels (v1.1)
+
+The MCP can also clean up the panels before the script is written. Say: *"Check my Gutter panels and fix the bad cuts"*, or pick the **review_panels** prompt.
+
+| Tool | What it does |
+|---|---|
+| `check_panels` | Lists panels that look like bad cuts (empty strips, lone speech bubbles, several panels stuck together, thin strips, big empty margins) with a suggested fix |
+| `remove_panels` | Removes panels (empty strips, credits, content warnings) |
+| `merge_panels` | Stacks neighbouring panels into one (a bubble with its picture, a character cut across two cuts) |
+| `split_panel` | Cuts a panel at given heights, or automatically at the gaps |
+| `crop_panel` | Crops to a box (left, top, right, bottom as 0-1) |
+| `trim_panel` | Crops away empty space around the drawing |
+| `restore_panel` | Puts a panel's original image back |
+| `add_panel` | Inserts a new image (file path, link or base64) |
+
+Every edit shows up in Gutter right away and can be undone there with Ctrl+Z. Needs Gutter 1.09 or newer.
+

@@ -14,7 +14,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 
-const string Version = "1.0.0";
+const string Version = "1.1.0";
 string[] protocols = { "2025-06-18", "2025-03-26", "2024-11-05" };
 var bridgeBase = (Environment.GetEnvironmentVariable("GUTTER_BRIDGE_URL") ?? "http://127.0.0.1:7330/").TrimEnd('/') + "/";
 var http = new HttpClient { BaseAddress = new Uri(bridgeBase), Timeout = TimeSpan.FromSeconds(60) };
@@ -28,6 +28,17 @@ const string Instructions = """
        narration line per panel that tells the story, including panels with no text.
     4. After each batch, call write_lines with those lines. They appear in Gutter immediately.
     5. Keep going until the last panel, carrying names and plot forward. Don't skip panels.
+
+    To check and fix the panels themselves (do this before writing, if asked or if panels look wrong):
+    1. Call check_panels. It lists panels that look like bad cuts (empty strips, lone speech bubbles,
+       several panels stuck together, big empty margins) with a suggested fix.
+    2. Look at the flagged panels (and their neighbours) with get_panels before changing anything,
+       and also watch for credits pages, content warnings, and characters cut off at an edge.
+    3. Fix with remove_panels, merge_panels, split_panel (exact heights, or auto), crop_panel, trim_panel.
+       restore_panel undoes edits to one panel's image, and the user can press Ctrl+Z in Gutter.
+       add_panel inserts a new image (file path, image link or base64).
+    4. Panel numbers shift after removing, merging or splitting: work from the last panel backwards,
+       or call check_panels / gutter_status again before the next edit.
     """;
 
 if (args.Length > 0 && args[0] == "--http")
@@ -190,6 +201,51 @@ JsonArray Tools() => new()
                 },
             },
         }, new[] { "lines" }),
+    Tool("check_panels", "Check panels for bad cuts",
+        "Scans every panel of the open project and lists the ones that look like bad cuts: empty background strips, a speech bubble cut away from its picture, several panels stuck together in one tall image, thin strips, and panels that are mostly empty space. Each comes with a suggested fix. Look at them with get_panels before fixing.",
+        new JsonObject()),
+    Tool("remove_panels", "Remove panels",
+        "Removes panels from the timeline (e.g. empty strips, credits, content warnings). Their images stay in the project's media.",
+        new JsonObject { ["panels"] = new JsonObject { ["type"] = "array", ["items"] = new JsonObject { ["type"] = "integer", ["minimum"] = 1 }, ["description"] = "Panel numbers to remove." } },
+        new[] { "panels" }),
+    Tool("merge_panels", "Merge panels",
+        "Stacks panels from..to (next to each other) into one image, top to bottom, e.g. a speech bubble with the picture it belongs to, or a character cut in half across two panels. Their narration lines are joined.",
+        new JsonObject
+        {
+            ["from"] = new JsonObject { ["type"] = "integer", ["minimum"] = 1, ["description"] = "First panel." },
+            ["to"] = new JsonObject { ["type"] = "integer", ["minimum"] = 1, ["description"] = "Last panel (inclusive)." },
+        }, new[] { "from", "to" }),
+    Tool("split_panel", "Split a panel",
+        "Cuts one panel into several at the given heights (shares of its height, 0 = top, 1 = bottom), e.g. [0.5] cuts it in half. Use auto: true to cut at the gaps Gutter finds. The first piece keeps the narration.",
+        new JsonObject
+        {
+            ["panel"] = new JsonObject { ["type"] = "integer", ["minimum"] = 1 },
+            ["at"] = new JsonObject { ["type"] = "array", ["items"] = new JsonObject { ["type"] = "number", ["minimum"] = 0, ["maximum"] = 1 }, ["description"] = "Where to cut, top to bottom, as shares of the height." },
+            ["auto"] = new JsonObject { ["type"] = "boolean", ["description"] = "Find the gaps automatically instead of 'at'." },
+        }, new[] { "panel" }),
+    Tool("crop_panel", "Crop a panel",
+        "Crops one panel's image to a box given as shares of the image (0-1): left, top, right, bottom. E.g. top 0.2 bottom 0.8 keeps the middle 60%. restore_panel undoes it.",
+        new JsonObject
+        {
+            ["panel"] = new JsonObject { ["type"] = "integer", ["minimum"] = 1 },
+            ["left"] = new JsonObject { ["type"] = "number", ["minimum"] = 0, ["maximum"] = 1, ["default"] = 0 },
+            ["top"] = new JsonObject { ["type"] = "number", ["minimum"] = 0, ["maximum"] = 1, ["default"] = 0 },
+            ["right"] = new JsonObject { ["type"] = "number", ["minimum"] = 0, ["maximum"] = 1, ["default"] = 1 },
+            ["bottom"] = new JsonObject { ["type"] = "number", ["minimum"] = 0, ["maximum"] = 1, ["default"] = 1 },
+        }, new[] { "panel" }),
+    Tool("trim_panel", "Trim empty edges",
+        "Crops away the empty space around the drawing in one panel, keeping a little margin.",
+        new JsonObject { ["panel"] = new JsonObject { ["type"] = "integer", ["minimum"] = 1 } }, new[] { "panel" }),
+    Tool("restore_panel", "Restore a panel's original image",
+        "Puts back the image the panel had when it was imported, undoing crops, splits and merges on it.",
+        new JsonObject { ["panel"] = new JsonObject { ["type"] = "integer", ["minimum"] = 1 } }, new[] { "panel" }),
+    Tool("add_panel", "Add a panel",
+        "Inserts a new image as a panel: a file path on this PC, an http(s) image link, or base64 JPEG/PNG data.",
+        new JsonObject
+        {
+            ["source"] = new JsonObject { ["type"] = "string", ["description"] = "File path, image URL, or base64 image data." },
+            ["after"] = new JsonObject { ["type"] = "integer", ["minimum"] = 0, ["description"] = "Insert after this panel number (0 = at the start). Default: at the end." },
+        }, new[] { "source" }),
     Tool("get_lines", "Get current lines",
         "Returns every panel's current narration line (empty string if none). Useful to continue where the script stopped.",
         new JsonObject()),
@@ -215,6 +271,16 @@ async Task<JsonNode> CallTool(JsonNode? p)
             "get_panels" => await Panels(a),
             "write_lines" => await WriteLines(a),
             "get_lines" => Text(DescribeLines(await Get("lines"))),
+            "check_panels" => Text(DescribeCheck(await Get("check"))),
+            "remove_panels" => await EditPanels(new JsonObject { ["action"] = "remove", ["panels"] = a["panels"]?.DeepClone() }),
+            "merge_panels" => await EditPanels(new JsonObject { ["action"] = "merge", ["from"] = a["from"]?.DeepClone(), ["to"] = a["to"]?.DeepClone() }),
+            "split_panel" => await EditPanels(a["auto"]?.ToString()?.ToLowerInvariant() == "true" || a["at"] == null
+                ? new JsonObject { ["action"] = "auto_split", ["panel"] = a["panel"]?.DeepClone() }
+                : new JsonObject { ["action"] = "split", ["panel"] = a["panel"]?.DeepClone(), ["at"] = a["at"]?.DeepClone() }),
+            "crop_panel" => await EditPanels(new JsonObject { ["action"] = "crop", ["panel"] = a["panel"]?.DeepClone(), ["left"] = a["left"]?.DeepClone(), ["top"] = a["top"]?.DeepClone(), ["right"] = a["right"]?.DeepClone(), ["bottom"] = a["bottom"]?.DeepClone() }),
+            "trim_panel" => await EditPanels(new JsonObject { ["action"] = "trim", ["panel"] = a["panel"]?.DeepClone() }),
+            "restore_panel" => await EditPanels(new JsonObject { ["action"] = "restore", ["panel"] = a["panel"]?.DeepClone() }),
+            "add_panel" => await EditPanels(new JsonObject { ["action"] = "add", ["source"] = a["source"]?.DeepClone(), ["after"] = a["after"]?.DeepClone() }),
             _ => throw new RpcException(-32602, $"Unknown tool: {name}"),
         };
     }
@@ -284,6 +350,24 @@ async Task<JsonNode> WriteLines(JsonObject a)
     return Text($"Wrote {json["applied"]} line(s) into Gutter (project has {json["total"]} panels).");
 }
 
+static string DescribeCheck(JsonObject c)
+{
+    var issues = c["issues"]!.AsArray();
+    if (issues.Count == 0) return $"All {c["total"]} panels look fine. (Still worth a glance with get_panels for credits pages or cut-off characters.)";
+    var sb = new StringBuilder($"{issues.Count} of {c["total"]} panels look like bad cuts:\n");
+    foreach (var i in issues) sb.AppendLine($"- Panel {i!["panel"]}: {i["problem"]} Suggested fix: {i["suggested_fix"]}.");
+    sb.Append("Look at them with get_panels first. Panel numbers shift after removing/merging/splitting, so fix from the last panel backwards.");
+    return sb.ToString();
+}
+
+async Task<JsonNode> EditPanels(JsonObject body)
+{
+    using var res = await http.PostAsync("panels/edit", new StringContent(body.ToJsonString(), Encoding.UTF8, "application/json"));
+    var json = JsonNode.Parse(await res.Content.ReadAsStringAsync()) as JsonObject ?? new JsonObject();
+    if (!res.IsSuccessStatusCode) return Text(json["error"]?.ToString() ?? $"Gutter answered {(int)res.StatusCode}.", isError: true);
+    return Text($"{json["result"]} The project now has {json["total"]} panels.");
+}
+
 static JsonObject Text(string text, bool isError = false) => new()
 {
     ["content"] = new JsonArray(new JsonObject { ["type"] = "text", ["text"] = text }),
@@ -296,6 +380,13 @@ JsonArray Prompts() => new()
 {
     new JsonObject
     {
+        ["name"] = "review_panels",
+        ["title"] = "Check and fix the Gutter panels",
+        ["description"] = "Find bad cuts in the open project (empty strips, lone bubbles, stuck-together panels, credits) and fix them.",
+        ["arguments"] = new JsonArray(),
+    },
+    new JsonObject
+    {
         ["name"] = "write_script",
         ["title"] = "Write the Gutter script",
         ["description"] = "Write narration for every panel of the project open in Gutter.",
@@ -305,6 +396,12 @@ JsonArray Prompts() => new()
 
 JsonObject GetPrompt(JsonNode? p)
 {
+    if (p?["name"]?.ToString() == "review_panels")
+        return new JsonObject
+        {
+            ["description"] = "Check and fix the Gutter panels",
+            ["messages"] = new JsonArray(new JsonObject { ["role"] = "user", ["content"] = new JsonObject { ["type"] = "text", ["text"] = Instructions + "\nCheck the panels of my open Gutter project now and fix the bad cuts. Tell me what you changed." } }),
+        };
     if (p?["name"]?.ToString() != "write_script") throw new RpcException(-32602, "Unknown prompt");
     var from = p?["arguments"]?["from_panel"]?.ToString();
     var text = Instructions + "\n" + (string.IsNullOrWhiteSpace(from)
